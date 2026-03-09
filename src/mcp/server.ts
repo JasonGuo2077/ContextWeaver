@@ -86,6 +86,12 @@ Examples of BAD queries:
           description:
             'HARD FILTERS. An optional list of EXACT, KNOWN identifiers (class/function names, constants) that MUST appear in the code. Only use terms you are 100% sure exist. Leave empty if exploring.',
         },
+        output_format: {
+          type: 'string',
+          enum: ['text', 'json'],
+          description:
+            "Output format. 'text' (default): human-readable markdown with code blocks. 'json': structured JSON with seedCount, expandedCount, files[].segments[].{startLine,endLine,score,breadcrumb,text}, timingMs — ideal for programmatic use.",
+        },
       },
       required: ['repo_path', 'information_request'],
     },

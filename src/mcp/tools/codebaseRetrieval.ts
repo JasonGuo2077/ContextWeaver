@@ -37,6 +37,12 @@ export const codebaseRetrievalSchema = z.object({
     .describe(
       'HARD FILTERS. Precise identifiers to narrow down results. Only use symbols KNOWN to exist to avoid false negatives.',
     ),
+  output_format: z
+    .enum(['text', 'json'])
+    .optional()
+    .describe(
+      "Output format. 'text' (default): human-readable markdown with code blocks. 'json': structured ContextPack object with seedCount, expandedCount, files, segments, timingMs — ideal for programmatic consumption.",
+    ),
 });
 
 export type CodebaseRetrievalInput = z.infer<typeof codebaseRetrievalSchema>;
@@ -197,7 +203,7 @@ export async function handleCodebaseRetrieval(
   configOverride: Partial<SearchConfig> = ZEN_CONFIG_OVERRIDE,
   onProgress?: ProgressCallback,
 ): Promise<{ content: Array<{ type: 'text'; text: string }> }> {
-  const { repo_path, information_request, technical_terms } = args;
+  const { repo_path, information_request, technical_terms, output_format = 'text' } = args;
 
   logger.info(
     {
@@ -302,17 +308,49 @@ export async function handleCodebaseRetrieval(
   );
 
   // 7. 格式化输出
-  return formatMcpResponse(contextPack);
+  return formatMcpResponse(contextPack, output_format);
 }
 
 // 响应格式化
 
 /**
  * 格式化为 MCP 响应格式
+ *
+ * @param pack ContextPack 搜索结果
+ * @param outputFormat 'text'（默认）返回可读 Markdown；'json' 返回结构化 JSON
  */
 function formatMcpResponse(
   pack: ContextPack,
+  outputFormat: 'text' | 'json' = 'text',
 ): { content: Array<{ type: 'text'; text: string }> } {
+  if (outputFormat === 'json') {
+    const structured = {
+      seedCount: pack.seeds.length,
+      expandedCount: pack.expanded.length,
+      fileCount: pack.files.length,
+      totalSegments: pack.files.reduce((acc, f) => acc + f.segments.length, 0),
+      files: pack.files.map((f) => ({
+        path: f.filePath,
+        segments: f.segments.map((s) => ({
+          startLine: s.startLine,
+          endLine: s.endLine,
+          score: s.score,
+          breadcrumb: s.breadcrumb,
+          text: s.text,
+        })),
+      })),
+      timingMs: pack.debug?.timingMs ?? {},
+    };
+    return {
+      content: [
+        {
+          type: 'text',
+          text: JSON.stringify(structured, null, 2),
+        },
+      ],
+    };
+  }
+
   const { files, seeds } = pack;
 
   // 构建文件内容块
