@@ -7,3 +7,4 @@ dist
 .ace-tool/
 .playwright-mcp/
 .snow
+.history
