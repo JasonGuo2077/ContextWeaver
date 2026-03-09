@@ -1,0 +1,29 @@
+{
+  "name": "codebase-retrieval",
+  "description": "从 ContextWeaver MCP 检索代码片段，返回语义匹配的代码段及其来源（文件路径、行号、面包屑）。调用前必须确认 repo_path 是被检索代码仓库的绝对路径。默认使用 output_format=json 以便程序化消费。",
+  "parameters": {
+    "type": "object",
+    "properties": {
+      "repo_path": {
+        "type": "string",
+        "description": "被检索代码仓库的绝对路径，例如 /home/user/projects/MyApp"
+      },
+      "information_request": {
+        "type": "string",
+        "description": "自然语言描述你要查找的功能、逻辑或行为。聚焦在 '它怎么工作' 而非精确名称，例如：'用户登录流程的入口与权限校验逻辑'"
+      },
+      "technical_terms": {
+        "type": "array",
+        "items": { "type": "string" },
+        "description": "可选。已知确实存在的精确符号（类名/方法名/常量），例如 [\"showBaseLoadingDialog\", \"XPBaseActivity\"]。留空表示纯语义检索。"
+      },
+      "output_format": {
+        "type": "string",
+        "enum": ["text", "json"],
+        "default": "json",
+        "description": "返回格式。json 返回结构化 ContextPack（含 files/segments/score/breadcrumb/timingMs），推荐程序化消费时使用；text 返回可读 Markdown。"
+      }
+    },
+    "required": ["repo_path", "information_request"]
+  }
+}
