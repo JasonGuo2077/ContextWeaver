@@ -97,45 +97,175 @@ RERANK_TOP_N=20
 cli
   .command('index [path]', '扫描代码库并建立索引')
   .option('-f, --force', '强制重新索引')
-  .action(async (targetPath: string | undefined, options: { force?: boolean }) => {
+  .option('--multi', '当传入父目录时自动索引所有子项目（识别独立 git 仓库 / Gradle 工程）')
+  .action(async (targetPath: string | undefined, options: { force?: boolean; multi?: boolean }) => {
     const rootPath = targetPath ? path.resolve(targetPath) : process.cwd();
-    const projectId = generateProjectId(rootPath);
 
-    logger.info(`开始扫描: ${rootPath}`);
-    logger.info(`项目 ID: ${projectId}`);
-    if (options.force) {
-      logger.info('强制重新索引: 是');
+    // ── 子项目检测辅助函数 ────────────────────────────────────────────────
+
+    /**
+     * 判断一个目录是否为独立项目：
+     * 1. 含 .git 目录（独立 git 仓库 ← 最优先）
+     * 2. 含 Gradle 构建文件（settings.gradle.kts / build.gradle.kts 等）
+     * 3. 含 Android 典型结构（app/ 子目录）
+     */
+    async function isProjectDir(p: string): Promise<boolean> {
+      try {
+        const entries = await fs.readdir(p);
+        if (entries.includes('.git')) return true;
+        if (
+          entries.some((n) =>
+            [
+              'settings.gradle',
+              'settings.gradle.kts',
+              'build.gradle',
+              'build.gradle.kts',
+            ].includes(n),
+          )
+        )
+          return true;
+        if (entries.includes('app')) {
+          const s = await fs.stat(path.join(p, 'app')).catch(() => null);
+          if (s?.isDirectory()) return true;
+        }
+        return false;
+      } catch {
+        return false;
+      }
     }
 
-    const startTime = Date.now();
+    /**
+     * 在 parent 目录下查找所有独立子项目路径。
+     *
+     * 策略：
+     * - 若 parent 本身是项目且 --multi 未指定，直接返回 [parent]（兼容原有行为）
+     * - 否则扫描一层子目录，找出所有包含 .git 或 Gradle 标识的子目录
+     * - 去重后返回
+     */
+    async function findSubprojects(parent: string): Promise<string[]> {
+      const projects = new Set<string>();
 
-    try {
-      // 进度日志节流：只在 30%、60%、90% 时输出（100% 由扫描完成日志代替）
-      let lastLoggedPercent = 0;
-      const stats: ScanStats = await scan(rootPath, {
-        force: options.force,
-        onProgress: (current, total, message) => {
-          if (total !== undefined) {
-            const percent = Math.floor((current / total) * 100);
-            if (percent >= lastLoggedPercent + 30 && percent < 100) {
-              logger.info(`索引进度: ${percent}% - ${message || ''}`);
-              lastLoggedPercent = Math.floor(percent / 30) * 30;
+      let entries: import('fs').Dirent[] = [];
+      try {
+        entries = await fs.readdir(parent, { withFileTypes: true });
+      } catch {
+        return [parent];
+      }
+
+      for (const e of entries) {
+        if (!e.isDirectory()) continue;
+        // 跳过隐藏目录（.git / .gradle 等）和常见噪音目录
+        if (e.name.startsWith('.') || e.name === 'node_modules' || e.name === 'build') continue;
+        const child = path.join(parent, e.name);
+        if (await isProjectDir(child)) {
+          projects.add(child);
+        }
+      }
+
+      return Array.from(projects);
+    }
+
+    // ── 决定本次要索引的项目列表 ──────────────────────────────────────────
+
+    let projectPaths: string[];
+
+    const parentIsProject = await isProjectDir(rootPath);
+
+    if (options.multi) {
+      // --multi 强制模式：扫描子目录，找出所有独立子项目
+      const subprojects = await findSubprojects(rootPath);
+      if (subprojects.length === 0) {
+        // 没找到任何子项目，降级为索引 rootPath 本身
+        logger.warn(`未在 ${rootPath} 下发现子项目，将直接索引该目录`);
+        projectPaths = [rootPath];
+      } else {
+        projectPaths = subprojects;
+      }
+    } else if (!parentIsProject) {
+      // 非 --multi 但传入路径本身不像项目 → 自动探测子项目
+      const subprojects = await findSubprojects(rootPath);
+      if (subprojects.length > 0) {
+        logger.info(
+          `检测到 ${subprojects.length} 个子项目，将分别索引（使用 --multi 可显式指定此行为）`,
+        );
+        projectPaths = subprojects;
+      } else {
+        projectPaths = [rootPath];
+      }
+    } else {
+      // 传入路径本身就是单个项目（原有行为）
+      projectPaths = [rootPath];
+    }
+
+    // ── 逐个索引 ─────────────────────────────────────────────────────────
+
+    logger.info(`待索引项目数量: ${projectPaths.length}`);
+    if (projectPaths.length > 1) {
+      for (const p of projectPaths) logger.info(`  • ${p}`);
+    }
+
+    const overallStart = Date.now();
+    const overallStats: ScanStats = {
+      totalFiles: 0,
+      added: 0,
+      modified: 0,
+      unchanged: 0,
+      deleted: 0,
+      skipped: 0,
+      errors: 0,
+    };
+
+    for (const projPath of projectPaths) {
+      const projectId = generateProjectId(projPath);
+      logger.info(`▶ 开始扫描: ${projPath}  (项目 ID: ${projectId})`);
+      if (options.force) logger.info('  强制重新索引: 是');
+
+      const startTime = Date.now();
+      try {
+        let lastLoggedPercent = 0;
+        const stats: ScanStats = await scan(projPath, {
+          force: options.force,
+          onProgress: (current, total, message) => {
+            if (total !== undefined) {
+              const percent = Math.floor((current / total) * 100);
+              if (percent >= lastLoggedPercent + 30 && percent < 100) {
+                logger.info(`  进度: ${percent}% - ${message || ''}`);
+                lastLoggedPercent = Math.floor(percent / 30) * 30;
+              }
             }
-          }
-        },
-      });
+          },
+        });
 
-      process.stdout.write('\n');
+        process.stdout.write('\n');
 
-      const duration = ((Date.now() - startTime) / 1000).toFixed(2);
-      logger.info(`索引完成 (${duration}s)`);
+        const duration = ((Date.now() - startTime) / 1000).toFixed(2);
+        logger.info(
+          `✔ 索引完成: ${projPath} (${duration}s) — 总数:${stats.totalFiles} 新增:${stats.added} 修改:${stats.modified} 未变:${stats.unchanged} 删除:${stats.deleted} 跳过:${stats.skipped} 错误:${stats.errors}`,
+        );
+
+        // 累加到全局统计
+        overallStats.totalFiles += stats.totalFiles;
+        overallStats.added += stats.added;
+        overallStats.modified += stats.modified;
+        overallStats.unchanged += stats.unchanged;
+        overallStats.deleted += stats.deleted;
+        overallStats.skipped += stats.skipped;
+        overallStats.errors += stats.errors;
+      } catch (err) {
+        const error = err as { message?: string; stack?: string };
+        logger.error({ err, stack: error.stack }, `✘ 索引失败: ${projPath} — ${error.message}`);
+        // 单个项目失败不中断其他项目的索引
+        overallStats.errors += 1;
+      }
+    }
+
+    // ── 汇总输出（多项目时） ──────────────────────────────────────────────
+
+    if (projectPaths.length > 1) {
+      const overallDuration = ((Date.now() - overallStart) / 1000).toFixed(2);
       logger.info(
-        `总数:${stats.totalFiles} 新增:${stats.added} 修改:${stats.modified} 未变:${stats.unchanged} 删除:${stats.deleted} 跳过:${stats.skipped} 错误:${stats.errors}`,
+        `━ 全部索引完成 (${overallDuration}s) — 总计 总数:${overallStats.totalFiles} 新增:${overallStats.added} 修改:${overallStats.modified} 未变:${overallStats.unchanged} 删除:${overallStats.deleted} 跳过:${overallStats.skipped} 错误:${overallStats.errors}`,
       );
-    } catch (err) {
-      const error = err as { message?: string; stack?: string };
-      logger.error({ err, stack: error.stack }, `索引失败: ${error.message}`);
-      process.exit(1);
     }
   });
 
@@ -215,12 +345,14 @@ cli
   .option('--repo-path <path>', '代码库根目录（默认当前目录）')
   .option('--information-request <text>', '自然语言问题描述（必填）')
   .option('--technical-terms <terms>', '精确术语（逗号分隔）')
+  .option('--output-format <format>', '输出格式：text（默认）或 json（结构化 ContextPack）')
   .option('--zen', '使用 MCP Zen 配置（默认开启）')
   .action(
     async (options: {
       repoPath?: string;
       informationRequest?: string;
       technicalTerms?: string;
+      outputFormat?: string;
       zen?: boolean;
     }) => {
       const repoPath = options.repoPath ? path.resolve(options.repoPath) : process.cwd();
@@ -235,6 +367,7 @@ cli
         .map((t) => t.trim())
         .filter(Boolean);
 
+      const outputFormat = (options.outputFormat === 'json' ? 'json' : 'text') as 'text' | 'json';
       const useZen = options.zen !== false;
 
       const { handleCodebaseRetrieval } = await import('./mcp/tools/codebaseRetrieval.js');
@@ -244,6 +377,7 @@ cli
           repo_path: repoPath,
           information_request: informationRequest,
           technical_terms: technicalTerms.length > 0 ? technicalTerms : undefined,
+          output_format: outputFormat,
         },
         useZen ? undefined : {},
       );
