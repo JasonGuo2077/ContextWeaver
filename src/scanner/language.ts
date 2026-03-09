@@ -14,6 +14,7 @@ const LANGUAGE_MAP: Record<string, string> = {
   '.rs': 'rust',
   '.java': 'java',
   '.kt': 'kotlin',
+  '.kts': 'kotlin',
   '.swift': 'swift',
   '.cpp': 'cpp',
   '.cc': 'cpp',
