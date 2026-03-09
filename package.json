@@ -52,6 +52,7 @@
     "tree-sitter-python": "0.25.0",
     "tree-sitter-rust": "0.24.0",
     "tree-sitter-typescript": "0.23.2",
+    "tree-sitter-kotlin": "0.3.8",
     "zod": "^4.2.1"
   },
   "devDependencies": {
@@ -76,7 +77,8 @@
       "tree-sitter-javascript",
       "tree-sitter-python",
       "tree-sitter-rust",
-      "tree-sitter-typescript"
+      "tree-sitter-typescript",
+      "tree-sitter-kotlin"
     ]
   }
 }

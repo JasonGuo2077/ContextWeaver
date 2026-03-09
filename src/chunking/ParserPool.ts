@@ -18,6 +18,7 @@ const GRAMMAR_MODULES: Record<string, string> = {
   c: 'tree-sitter-c',
   cpp: 'tree-sitter-cpp',
   c_sharp: 'tree-sitter-c-sharp',
+  kotlin: 'tree-sitter-kotlin',
 };
 
 // 缓存已加载的语法
@@ -60,7 +61,7 @@ async function loadGrammar(language: string): Promise<TreeSitterLanguage | null>
       if (exported && typeof exported === 'object' && 'nodeTypeInfo' in exported) {
         grammar = exported;
       }
-      // 尝试 language property（某些版本使用这种格式）
+      // 尝试 language property（某些版本使用这种格式，例如 tree-sitter-kotlin: { language, nodeTypeInfo }）
       else if (exported?.language) {
         grammar = exported.language;
       }

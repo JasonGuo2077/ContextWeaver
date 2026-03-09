@@ -6,6 +6,7 @@
  * - Python
  * - Go
  * - Java
+ * - Kotlin (Android)
  * - Rust
  * - C/C++
  * - C#
@@ -16,6 +17,7 @@ import { CSharpResolver } from './CSharpResolver.js';
 import { GoResolver } from './GoResolver.js';
 import { JavaResolver } from './JavaResolver.js';
 import { JsTsResolver } from './JsTsResolver.js';
+import { KotlinResolver } from './KotlinResolver.js';
 import { PythonResolver } from './PythonResolver.js';
 import { RustResolver } from './RustResolver.js';
 import type { ImportResolver } from './types.js';
@@ -31,6 +33,7 @@ export function createResolvers(): ImportResolver[] {
     new PythonResolver(),
     new GoResolver(),
     new JavaResolver(),
+    new KotlinResolver(),
     new RustResolver(),
     new CppResolver(),
     new CSharpResolver(),

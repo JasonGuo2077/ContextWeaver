@@ -223,6 +223,42 @@ const LANGUAGE_SPECS: Record<string, LanguageSpecConfig> = {
     },
     commentTypes: new Set(['comment']),
   },
+
+  kotlin: {
+    hierarchy: new Set([
+      // 顶层声明（class / data class / sealed class / abstract class / interface / object）
+      // Kotlin grammar 将上述全部映射为 class_declaration（通过修饰符区分）
+      'class_declaration',
+      // 顶层单例对象 (object Foo { })
+      'object_declaration',
+      // 伴生对象 (companion object { })
+      'companion_object',
+      // 顶层函数 / 成员函数
+      'function_declaration',
+      // 次构造函数
+      'secondary_constructor',
+      // 枚举条目（仅当作分片层级，不强制换块）
+      'enum_entry',
+      // 类型别名
+      'type_alias',
+    ]),
+    nameFields: ['name'],
+    nameNodeTypes: new Set([
+      'simple_identifier', // Kotlin grammar 主要使用 simple_identifier
+      'identifier',        // 备用
+      'type_identifier',   // 类型名
+    ]),
+    prefixMap: {
+      class_declaration: 'class ',
+      object_declaration: 'object ',
+      companion_object: 'companion object ',
+      function_declaration: 'fun ',
+      secondary_constructor: 'constructor ',
+      enum_entry: '',
+      type_alias: 'typealias ',
+    },
+    commentTypes: new Set(['line_comment', 'multiline_comment']),
+  },
 };
 
 /**
