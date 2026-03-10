@@ -15,7 +15,7 @@ import path from 'node:path';
 import { z } from 'zod';
 import { generateProjectId } from '../../db/index.js';
 // 注意：SearchService 和 scan 改为延迟导入，避免在 MCP 启动时就加载 native 模块
-import type { ContextPack, SearchConfig, Segment } from '../../search/types.js';
+import type { ContextPack, SearchConfig, Segment, ScoredChunk } from '../../search/types.js';
 import { logger } from '../../utils/logger.js';
 
 // 工具 Schema (暴露给 LLM)
@@ -42,6 +42,18 @@ export const codebaseRetrievalSchema = z.object({
     .optional()
     .describe(
       "Output format. 'text' (default): human-readable markdown with code blocks. 'json': structured ContextPack object with seedCount, expandedCount, files, segments, timingMs — ideal for programmatic consumption.",
+    ),
+  multi_project: z
+    .boolean()
+    .optional()
+    .describe(
+      "Set to true when repo_path is a parent directory containing multiple indexed sub-repositories. The search will aggregate results across all indexed sub-projects found under repo_path. Default: false (treat repo_path as a single project).",
+    ),
+  self_heal: z
+    .boolean()
+    .optional()
+    .describe(
+      "Set to false to skip automatic index creation/repair. When false, if a project is not yet indexed, the tool will return an error instead of triggering indexing. Default: true (auto-index on first use).",
     ),
 });
 
@@ -133,22 +145,66 @@ function isProjectIndexed(projectId: string): boolean {
 }
 
 /**
+ * 扫描 parentPath 下所有子目录，找出已建立索引的子项目
+ * 返回 Array<{ subPath, projectId }>
+ */
+function findIndexedSubProjects(
+  parentPath: string,
+): Array<{ subPath: string; projectId: string }> {
+  const result: Array<{ subPath: string; projectId: string }> = [];
+  let entries: string[];
+  try {
+    entries = fs.readdirSync(parentPath);
+  } catch {
+    return result;
+  }
+  for (const entry of entries) {
+    const subPath = path.join(parentPath, entry);
+    try {
+      const stat = fs.statSync(subPath);
+      if (!stat.isDirectory()) continue;
+    } catch {
+      continue;
+    }
+    const projectId = generateProjectId(subPath);
+    if (isProjectIndexed(projectId)) {
+      result.push({ subPath, projectId });
+    }
+  }
+  return result;
+}
+
+/**
  * 确保代码库已索引
  *
  * 策略：
+ * - 如果 selfHeal=false 且数据库不存在，直接抛出错误
  * - 如果代码库未初始化（数据库不存在），执行完整索引
  * - 如果已初始化，执行增量索引（只索引变更的文件）
  * - 使用文件锁防止多进程竞态
  *
  * @param repoPath 代码库路径
  * @param projectId 项目 ID
+ * @param selfHeal 是否允许自动创建/修复索引（默认 true）
  * @param onProgress 可选的进度回调
  */
 async function ensureIndexed(
   repoPath: string,
   projectId: string,
+  selfHeal = true,
   onProgress?: (current: number, total?: number, message?: string) => void,
 ): Promise<void> {
+  // self_heal=false 时，未索引直接报错，不触发重建
+  if (!selfHeal) {
+    if (!isProjectIndexed(projectId)) {
+      throw new Error(
+        `项目未索引（self_heal=false）: ${repoPath}（projectId=${projectId.slice(0, 10)}）。请先运行 contextweaver index 建立索引。`,
+      );
+    }
+    logger.debug({ projectId: projectId.slice(0, 10) }, 'self_heal=false，跳过自愈检查');
+    return;
+  }
+
   // 延迟导入锁和 scan 函数（避免 MCP 启动时加载 native 模块）
   const { withLock } = await import('../../utils/lock.js');
   const { scan } = await import('../../scanner/index.js');
@@ -203,13 +259,22 @@ export async function handleCodebaseRetrieval(
   configOverride: Partial<SearchConfig> = ZEN_CONFIG_OVERRIDE,
   onProgress?: ProgressCallback,
 ): Promise<{ content: Array<{ type: 'text'; text: string }> }> {
-  const { repo_path, information_request, technical_terms, output_format = 'text' } = args;
+  const {
+    repo_path,
+    information_request,
+    technical_terms,
+    output_format = 'text',
+    multi_project = false,
+    self_heal = true,
+  } = args;
 
   logger.info(
     {
       repo_path,
       information_request,
       technical_terms,
+      multi_project,
+      self_heal,
     },
     'MCP codebase-retrieval 调用开始',
   );
@@ -222,21 +287,150 @@ export async function handleCodebaseRetrieval(
 
   if (allMissingVars.length > 0) {
     logger.warn({ missingVars: allMissingVars }, 'MCP 环境变量未配置');
-    // 自动创建默认 .env 文件
     await ensureDefaultEnvFile();
     return formatEnvMissingResponse(allMissingVars);
   }
 
-  // 1. 生成项目 ID（与 CLI 保持一致：路径 + 目录创建时间）
+  // 合并查询（semantic + technical terms）
+  const query = [information_request, ...(technical_terms || [])].filter(Boolean).join(' ');
+
+  // =========================================
+  // 多项目聚合模式
+  // =========================================
+  if (multi_project) {
+    const subProjects = findIndexedSubProjects(repo_path);
+
+    if (subProjects.length === 0) {
+      return {
+        content: [
+          {
+            type: 'text',
+            text: `multi_project=true 但在 ${repo_path} 下未找到任何已索引的子项目。请先运行 contextweaver index 对各子目录建立索引。`,
+          },
+        ],
+      };
+    }
+
+    logger.info(
+      {
+        repo_path,
+        subProjectCount: subProjects.length,
+        subProjects: subProjects.map((p) => ({ path: p.subPath, id: p.projectId.slice(0, 10) })),
+      },
+      'MCP 多项目聚合搜索',
+    );
+
+    const { SearchService } = await import('../../search/SearchService.js');
+
+    // ── 阶段一：并发轻量召回（各子项目只做向量+FTS，不 rerank）────────────────
+    const t1 = Date.now();
+    const retrieveResults = await Promise.allSettled(
+      subProjects.map(async ({ subPath, projectId }) => {
+        const service = new SearchService(projectId, subPath, configOverride);
+        await service.init();
+        const candidates = await service.retrieveOnly(query);
+        return { subPath, projectId, service, candidates };
+      }),
+    );
+
+    // 收集成功的召回结果
+    // 用 _projectId 临时字段给每个 candidate 打标（spread 到 rerank 结果时会保留）
+    let successCount = 0;
+    const allCandidates: (ScoredChunk & { _projectId: string })[] = [];
+    const serviceMap = new Map<string, InstanceType<typeof SearchService>>();
+
+    for (const result of retrieveResults) {
+      if (result.status === 'fulfilled') {
+        successCount++;
+        serviceMap.set(result.value.projectId, result.value.service);
+        for (const c of result.value.candidates) {
+          allCandidates.push({ ...c, _projectId: result.value.projectId });
+        }
+      } else {
+        logger.warn({ reason: String(result.reason) }, '子项目召回失败');
+      }
+    }
+
+    logger.info(
+      {
+        subProjectCount: subProjects.length,
+        successCount,
+        totalCandidates: allCandidates.length,
+        retrieveMs: Date.now() - t1,
+      },
+      'MCP 多项目阶段一召回完成',
+    );
+
+    if (serviceMap.size === 0 || allCandidates.length === 0) {
+      return {
+        content: [
+          {
+            type: 'text',
+            text: `多项目搜索：${successCount}/${subProjects.length} 个子项目召回完成，但无任何候选结果。请检查查询词或确认各子项目已正确索引。`,
+          },
+        ],
+      };
+    }
+
+    // ── 阶段二：全局一次 rerank（rerank 只依赖文本内容，不依赖 DB，任选一个 service）
+    const t2 = Date.now();
+    const anchorService = serviceMap.values().next().value as InstanceType<typeof SearchService>;
+    // rerankAndCutoff 内部 spread 时会保留 _projectId 字段
+    const globalSeeds = (await anchorService.rerankAndCutoff(
+      query,
+      allCandidates,
+    )) as (ScoredChunk & { _projectId?: string })[];
+    logger.info({ rerankMs: Date.now() - t2, seedCount: globalSeeds.length }, 'MCP 多项目阶段二全局 rerank 完成');
+
+    // ── 阶段三：按子项目分组 expand + pack ──────────────────────────────────────
+    const t3 = Date.now();
+    const seedsByProject = new Map<string, ScoredChunk[]>();
+    for (const seed of globalSeeds) {
+      const pid = seed._projectId;
+      if (!pid) continue;
+      if (!seedsByProject.has(pid)) seedsByProject.set(pid, []);
+      seedsByProject.get(pid)!.push(seed);
+    }
+
+    // 各子项目并发 expand+pack
+    const packResults = await Promise.allSettled(
+      Array.from(seedsByProject.entries()).map(async ([pid, seeds]) => {
+        const svc = serviceMap.get(pid)!;
+        return svc.expandAndPack(query, seeds);
+      }),
+    );
+
+    const successPacks: ContextPack[] = [];
+    for (const r of packResults) {
+      if (r.status === 'fulfilled') successPacks.push(r.value);
+      else logger.warn({ reason: String(r.reason) }, '子项目 expand+pack 失败');
+    }
+
+    const mergedPack = mergeContextPacks(successPacks, query);
+    // 合并后的 seeds 要用全局 rerank 后的（包含所有子项目的 seeds）
+    mergedPack.seeds = globalSeeds;
+
+    logger.info(
+      {
+        subProjectCount: subProjects.length,
+        successCount,
+        seedCount: globalSeeds.length,
+        fileCount: mergedPack.files.length,
+        expandAndPackMs: Date.now() - t3,
+      },
+      'MCP 多项目聚合完成',
+    );
+
+    return formatMcpResponse(mergedPack, output_format);
+  }
+
+  // =========================================
+  // 单项目模式
+  // =========================================
   const projectId = generateProjectId(repo_path);
 
-  // 2. 确保代码库已索引（自动初始化 + 增量更新）
-  await ensureIndexed(repo_path, projectId, onProgress);
-
-  // 3. 合并查询
-  // - information_request 驱动语义向量搜索
-  // - technical_terms 增强词法（FTS）匹配
-  const query = [information_request, ...(technical_terms || [])].filter(Boolean).join(' ');
+  // 自愈检查（单项目模式）
+  await ensureIndexed(repo_path, projectId, self_heal, onProgress);
 
   logger.info(
     {
@@ -247,15 +441,11 @@ export async function handleCodebaseRetrieval(
     'MCP 查询构建',
   );
 
-  // 4. 延迟导入 SearchService（避免 MCP 启动时加载 native 模块）
   const { SearchService } = await import('../../search/SearchService.js');
-
-  // 5. 创建 SearchService 实例（使用 Zen Config）
   const service = new SearchService(projectId, repo_path, configOverride);
   await service.init();
   logger.debug('SearchService 初始化完成');
 
-  // 6. 执行搜索
   const contextPack = await service.buildContextPack(query);
 
   // 详细日志：seeds 信息
@@ -307,8 +497,56 @@ export async function handleCodebaseRetrieval(
     'MCP codebase-retrieval 完成',
   );
 
-  // 7. 格式化输出
   return formatMcpResponse(contextPack, output_format);
+}
+
+/**
+ * 合并多个 ContextPack 为一个（多项目聚合用）
+ *
+ * 策略：
+ * - seeds/expanded 按 score 全局排序后取 top N
+ * - files 段落去重（相同 filePath+startLine 只保留一份）
+ */
+function mergeContextPacks(packs: ContextPack[], query: string): ContextPack {
+  if (packs.length === 0) {
+    return { query, seeds: [], expanded: [], files: [], debug: { wVec: 0, wLex: 0, timingMs: {} } };
+  }
+  if (packs.length === 1) return packs[0];
+
+  const allSeeds = packs.flatMap((p) => p.seeds).sort((a, b) => b.score - a.score);
+  const allExpanded = packs.flatMap((p) => p.expanded).sort((a, b) => b.score - a.score);
+
+  // 文件段落去重：key = filePath + startLine
+  const seenSegments = new Set<string>();
+  const mergedFiles: ContextPack['files'] = [];
+
+  for (const pack of packs) {
+    for (const file of pack.files) {
+      const dedupedSegments = file.segments.filter((seg) => {
+        const key = `${file.filePath}:${seg.startLine}`;
+        if (seenSegments.has(key)) return false;
+        seenSegments.add(key);
+        return true;
+      });
+      if (dedupedSegments.length > 0) {
+        // 检查是否已有该文件
+        const existing = mergedFiles.find((f) => f.filePath === file.filePath);
+        if (existing) {
+          existing.segments.push(...dedupedSegments);
+        } else {
+          mergedFiles.push({ ...file, segments: dedupedSegments });
+        }
+      }
+    }
+  }
+
+  return {
+    query,
+    seeds: allSeeds,
+    expanded: allExpanded,
+    files: mergedFiles,
+    debug: { wVec: packs[0].debug?.wVec ?? 0, wLex: packs[0].debug?.wLex ?? 0, timingMs: {} },
+  };
 }
 
 // 响应格式化

@@ -94,12 +94,136 @@ RERANK_TOP_N=20
   logger.info('初始化完成！');
 });
 
+/** repo_map.json 中单个仓库条目的结构 */
+interface RepoMapEntry {
+  repo_id: string;
+  enabled?: boolean;
+  [key: string]: unknown;
+}
+
+/** repo_map.json 顶层结构 */
+interface RepoMapConfig {
+  sentry_project_map?: Record<string, RepoMapEntry[]>;
+  [key: string]: unknown;
+}
+
 cli
   .command('index [path]', '扫描代码库并建立索引')
   .option('-f, --force', '强制重新索引')
   .option('--multi', '当传入父目录时自动索引所有子项目（识别独立 git 仓库 / Gradle 工程）')
-  .action(async (targetPath: string | undefined, options: { force?: boolean; multi?: boolean }) => {
+  .option('--config <file>', '按 repo_map.json 配置文件批量索引（每个 repo_id 单独建索引）')
+  .option('--base-dir <dir>', '配合 --config 使用：本地仓库的根目录（repo_id 目录所在的父目录）')
+  .option('--sentry-project <name>', '配合 --config 使用：只索引指定 sentry_project_map key 下的仓库（默认全部）')
+  .action(async (targetPath: string | undefined, options: { force?: boolean; multi?: boolean; config?: string; baseDir?: string; sentryProject?: string }) => {
     const rootPath = targetPath ? path.resolve(targetPath) : process.cwd();
+
+    // ── --config 模式：按 repo_map.json 逐仓库建独立索引 ─────────────────
+    if (options.config) {
+      const cfgPath = path.resolve(options.config);
+      let cfg: RepoMapConfig;
+      try {
+        cfg = JSON.parse(await fs.readFile(cfgPath, 'utf-8')) as RepoMapConfig;
+      } catch (err) {
+        const e = err as { message?: string };
+        logger.error({ err }, `无法读取配置文件: ${cfgPath} — ${e.message}`);
+        process.exit(1);
+      }
+
+      // 收集所有启用的 repo 条目
+      let entries: RepoMapEntry[] = [];
+      if (cfg.sentry_project_map) {
+        const map = cfg.sentry_project_map;
+        const keys = options.sentryProject ? [options.sentryProject] : Object.keys(map);
+        for (const key of keys) {
+          if (!map[key]) {
+            logger.warn(`sentry_project_map 中不存在 key: ${key}`);
+            continue;
+          }
+          entries.push(...map[key]);
+        }
+      } else {
+        logger.error({}, `配置文件缺少 sentry_project_map 字段: ${cfgPath}`);
+        process.exit(1);
+      }
+
+      // 过滤 disabled
+      const active = entries.filter((e) => e.enabled !== false);
+      logger.info(`配置文件共 ${entries.length} 个仓库，启用 ${active.length} 个`);
+      if (active.length === 0) { process.exit(0); }
+
+      // 解析 base-dir
+      const baseDir = options.baseDir ? path.resolve(options.baseDir) : rootPath;
+
+      // 逐仓库索引
+      const overallStart = Date.now();
+      const overallStats: ScanStats = { totalFiles: 0, added: 0, modified: 0, unchanged: 0, deleted: 0, skipped: 0, errors: 0 };
+      const notFound: string[] = [];
+
+      for (const entry of active) {
+        const repoId = entry.repo_id;
+        // 优先精确匹配，再尝试小写
+        const candidates = [
+          path.join(baseDir, repoId),
+          path.join(baseDir, repoId.toLowerCase()),
+        ];
+        let repoPath: string | null = null;
+        for (const c of candidates) {
+          try {
+            if ((await fs.stat(c)).isDirectory()) { repoPath = c; break; }
+          } catch { /* not found */ }
+        }
+
+        if (!repoPath) {
+          logger.warn(`[${repoId}] 本地目录未找到，跳过。候选路径: ${candidates.join(', ')}`);
+          notFound.push(repoId);
+          overallStats.errors += 1;
+          continue;
+        }
+
+        const projectId = generateProjectId(repoPath);
+        logger.info(`▶ [${repoId}] 开始扫描: ${repoPath}  (项目 ID: ${projectId})`);
+        if (options.force) logger.info('  强制重新索引: 是');
+
+        const startTime = Date.now();
+        try {
+          let lastLoggedPercent = 0;
+          const stats: ScanStats = await scan(repoPath, {
+            force: options.force,
+            onProgress: (current, total, message) => {
+              if (total !== undefined) {
+                const percent = Math.floor((current / total) * 100);
+                if (percent >= lastLoggedPercent + 30 && percent < 100) {
+                  logger.info(`  [${repoId}] 进度: ${percent}% - ${message || ''}`);
+                  lastLoggedPercent = Math.floor(percent / 30) * 30;
+                }
+              }
+            },
+          });
+          process.stdout.write('\n');
+          const duration = ((Date.now() - startTime) / 1000).toFixed(2);
+          logger.info(`✔ [${repoId}] 索引完成 (${duration}s) — 总数:${stats.totalFiles} 新增:${stats.added} 修改:${stats.modified} 未变:${stats.unchanged} 删除:${stats.deleted} 跳过:${stats.skipped} 错误:${stats.errors}`);
+          overallStats.totalFiles += stats.totalFiles;
+          overallStats.added += stats.added;
+          overallStats.modified += stats.modified;
+          overallStats.unchanged += stats.unchanged;
+          overallStats.deleted += stats.deleted;
+          overallStats.skipped += stats.skipped;
+          overallStats.errors += stats.errors;
+        } catch (err) {
+          const error = err as { message?: string; stack?: string };
+          logger.error({ err, stack: error.stack }, `✘ [${repoId}] 索引失败 — ${error.message}`);
+          overallStats.errors += 1;
+        }
+      }
+
+      // 汇总
+      const overallDuration = ((Date.now() - overallStart) / 1000).toFixed(2);
+      logger.info(`━ 全部索引完成 (${overallDuration}s) — 总计 总数:${overallStats.totalFiles} 新增:${overallStats.added} 修改:${overallStats.modified} 未变:${overallStats.unchanged} 删除:${overallStats.deleted} 跳过:${overallStats.skipped} 错误:${overallStats.errors}`);
+      if (notFound.length > 0) {
+        logger.warn(`以下仓库未找到本地目录（共 ${notFound.length} 个）: ${notFound.join(', ')}`);
+      }
+      return;
+    }
 
     // ── 子项目检测辅助函数 ────────────────────────────────────────────────
 
@@ -347,6 +471,8 @@ cli
   .option('--technical-terms <terms>', '精确术语（逗号分隔）')
   .option('--output-format <format>', '输出格式：text（默认）或 json（结构化 ContextPack）')
   .option('--zen', '使用 MCP Zen 配置（默认开启）')
+  .option('--no-self-heal', '禁用自愈重建索引，未索引时直接报错（默认开启自愈）')
+  .option('--multi-project', '多项目模式：repo-path 是包含多个子仓库的父目录，跨子项目聚合搜索')
   .action(
     async (options: {
       repoPath?: string;
@@ -354,6 +480,8 @@ cli
       technicalTerms?: string;
       outputFormat?: string;
       zen?: boolean;
+      selfHeal?: boolean;
+      multiProject?: boolean;
     }) => {
       const repoPath = options.repoPath ? path.resolve(options.repoPath) : process.cwd();
       const informationRequest = options.informationRequest;
@@ -369,6 +497,9 @@ cli
 
       const outputFormat = (options.outputFormat === 'json' ? 'json' : 'text') as 'text' | 'json';
       const useZen = options.zen !== false;
+      // --no-self-heal 时 cac 将 selfHeal 设为 false，未传时为 undefined（视为 true）
+      const selfHeal = options.selfHeal !== false;
+      const multiProject = options.multiProject === true;
 
       const { handleCodebaseRetrieval } = await import('./mcp/tools/codebaseRetrieval.js');
 
@@ -378,6 +509,8 @@ cli
           information_request: informationRequest,
           technical_terms: technicalTerms.length > 0 ? technicalTerms : undefined,
           output_format: outputFormat,
+          self_heal: selfHeal,
+          multi_project: multiProject,
         },
         useZen ? undefined : {},
       );

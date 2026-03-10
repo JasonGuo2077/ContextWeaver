@@ -92,6 +92,16 @@ Examples of BAD queries:
           description:
             "Output format. 'text' (default): human-readable markdown with code blocks. 'json': structured JSON with seedCount, expandedCount, files[].segments[].{startLine,endLine,score,breadcrumb,text}, timingMs — ideal for programmatic use.",
         },
+        multi_project: {
+          type: 'boolean',
+          description:
+            "Set to true when repo_path is a parent directory containing multiple indexed sub-repositories. The search will aggregate results across all indexed sub-projects found under repo_path. Default: false (treat repo_path as a single project).",
+        },
+        self_heal: {
+          type: 'boolean',
+          description:
+            "Set to false to skip automatic index creation/repair. When false, if a project is not yet indexed the tool returns an error instead of triggering indexing. Default: true (auto-index on first use).",
+        },
       },
       required: ['repo_path', 'information_request'],
     },

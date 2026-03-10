@@ -156,15 +156,90 @@ export class Indexer {
    * 2. LanceDB 写入批量化：N 次 upsertFile → 1 次 batchUpsertFiles
    * 3. FTS 写入批量化：N 次删除+插入 → 1 次批量删除 + 1 次批量插入
    * 4. 日志汇总化：逐文件日志 → 汇总日志
+   * 5. Chunk 分批：按 chunk 数量拆分，每批最多 MAX_CHUNKS_PER_BATCH 个 chunk，
+   *    避免 OOM（大项目文件数多时单批 allTexts 暴涨）和 HTTP 413
    */
   private async batchIndex(
     db: Database.Database,
     files: FileToIndex[],
     onProgress?: (indexed: number, total: number) => void,
   ): Promise<{ success: number; errors: number }> {
-    if (files.length === 0) {
-      return { success: 0, errors: 0 };
+    if (files.length === 0) return { success: 0, errors: 0 };
+
+    // 按 chunk 数量分批，每批最多 400 个 chunk（约 20 个 API 请求）
+    const MAX_CHUNKS_PER_BATCH = 400;
+
+    // 统计总 chunk 数
+    const totalChunks = files.reduce((sum, f) => sum + f.chunks.length, 0);
+
+    // 按 chunk 数量切出子批次（保持文件完整性，不拆散单个文件）
+    const chunkBatches: FileToIndex[][] = [];
+    let currentBatch: FileToIndex[] = [];
+    let currentChunkCount = 0;
+
+    for (const file of files) {
+      // 单文件 chunk 数超限时单独成批
+      if (file.chunks.length >= MAX_CHUNKS_PER_BATCH) {
+        if (currentBatch.length > 0) {
+          chunkBatches.push(currentBatch);
+          currentBatch = [];
+          currentChunkCount = 0;
+        }
+        chunkBatches.push([file]);
+        continue;
+      }
+      // 加入当前批次后会超限，先提交当前批次
+      if (currentChunkCount + file.chunks.length > MAX_CHUNKS_PER_BATCH && currentBatch.length > 0) {
+        chunkBatches.push(currentBatch);
+        currentBatch = [];
+        currentChunkCount = 0;
+      }
+      currentBatch.push(file);
+      currentChunkCount += file.chunks.length;
     }
+    if (currentBatch.length > 0) {
+      chunkBatches.push(currentBatch);
+    }
+
+    const totalBatches = chunkBatches.length;
+    if (totalBatches > 1) {
+      logger.info(
+        { files: files.length, chunks: totalChunks, batches: totalBatches },
+        `分 ${totalBatches} 批次处理（每批最多 ${MAX_CHUNKS_PER_BATCH} 个 chunk）`,
+      );
+    }
+
+    let totalSuccess = 0;
+    let totalErrors = 0;
+
+    for (let i = 0; i < chunkBatches.length; i++) {
+      const batch = chunkBatches[i];
+      const batchChunks = batch.reduce((s, f) => s + f.chunks.length, 0);
+      if (totalBatches > 1) {
+        logger.info(
+          { batchNum: i + 1, totalBatches, files: batch.length, chunks: batchChunks },
+          `文件批次 ${i + 1}/${totalBatches}`,
+        );
+      }
+      const result = await this.batchIndexChunk(db, batch, totalSuccess, files.length, onProgress);
+      totalSuccess += result.success;
+      totalErrors += result.errors;
+    }
+
+    return { success: totalSuccess, errors: totalErrors };
+  }
+
+  /**
+   * 单批次内部实现（chunk 数量已控制在 MAX_CHUNKS_PER_BATCH 以内）
+   */
+  private async batchIndexChunk(
+    db: Database.Database,
+    files: FileToIndex[],
+    globalSuccessCount: number,
+    globalTotalCount: number,
+    onProgress?: (indexed: number, total: number) => void,
+  ): Promise<{ success: number; errors: number }> {
+    if (files.length === 0) return { success: 0, errors: 0 };
 
     // ===== 阶段 1: 收集所有需要 embedding 的文本 =====
     const allTexts: string[] = [];
@@ -174,31 +249,29 @@ export class Indexer {
       const file = files[fileIdx];
       globalIndexByFileChunk[fileIdx] = [];
       for (let chunkIdx = 0; chunkIdx < file.chunks.length; chunkIdx++) {
-        const globalIdx = allTexts.length;
+        globalIndexByFileChunk[fileIdx][chunkIdx] = allTexts.length;
         allTexts.push(file.chunks[chunkIdx].vectorText);
-        globalIndexByFileChunk[fileIdx][chunkIdx] = globalIdx;
       }
     }
 
-    if (allTexts.length === 0) {
-      return { success: 0, errors: 0 };
-    }
+    if (allTexts.length === 0) return { success: 0, errors: 0 };
 
     // ===== 阶段 2: 批量获取 embeddings =====
     logger.info({ count: allTexts.length, files: files.length }, '开始批量 Embedding');
 
     let embeddings: number[][];
     try {
-      // 传递进度回调给 embedBatch，让它在每个 API 批次完成时报告进度
-      const results = await this.embeddingClient.embedBatch(allTexts, 20, onProgress);
+      const progressWrapper = onProgress
+        ? (indexed: number, _total: number) => {
+            onProgress(globalSuccessCount + indexed, globalTotalCount);
+          }
+        : undefined;
+      const results = await this.embeddingClient.embedBatch(allTexts, 20, progressWrapper);
       embeddings = results.map((r) => r.embedding);
     } catch (err) {
       const error = err as { message?: string; stack?: string };
       logger.error({ error: error.message, stack: error.stack }, 'Embedding 失败');
-      clearVectorIndexHash(
-        db,
-        files.map((f) => f.path),
-      );
+      clearVectorIndexHash(db, files.map((f) => f.path));
       return { success: 0, errors: files.length };
     }
 

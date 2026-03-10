@@ -120,6 +120,123 @@ export class SearchService {
     };
   }
 
+  /**
+   * 仅召回阶段（多项目漏斗优化用）
+   *
+   * 执行混合召回 + RRF 融合 + topM 截取，不做 rerank。
+   * 适合多项目模式：各子项目并发 retrieveOnly()，合并后再统一 rerank。
+   *
+   * @returns 按融合分数降序排列的 topM 候选
+   */
+  async retrieveOnly(query: string): Promise<ScoredChunk[]> {
+    const candidates = await this.hybridRetrieve(query);
+    return candidates.sort((a, b) => b.score - a.score).slice(0, this.config.fusedTopM);
+  }
+
+  /**
+   * 从已合并的候选集构建上下文包（多项目漏斗优化用）
+   *
+   * 接收跨项目合并后的候选，执行 rerank → smartCutoff → expand → pack。
+   * 用于多项目模式：所有子项目 retrieveOnly() 合并后调一次此方法。
+   *
+   * @param query 查询语句
+   * @param candidates 已合并的跨项目候选（ScoredChunk[]，来自多个子项目的 retrieveOnly 结果）
+   */
+  async buildContextPackFromCandidates(
+    query: string,
+    candidates: ScoredChunk[],
+  ): Promise<ContextPack> {
+    const timingMs: Record<string, number> = {};
+    let t0 = Date.now();
+
+    // 取全局 topM（candidates 已经是各子项目的 topM，再做一次全局截取）
+    const topM = candidates.sort((a, b) => b.score - a.score).slice(0, this.config.fusedTopM);
+
+    // 1. 全局 Rerank
+    const reranked = await this.rerank(query, topM);
+    timingMs.rerank = Date.now() - t0;
+
+    // 2. Smart TopK Cutoff
+    t0 = Date.now();
+    const seeds = this.applySmartCutoff(reranked);
+    timingMs.smartCutoff = Date.now() - t0;
+
+    // 3. 扩展
+    t0 = Date.now();
+    const queryTokens = this.extractQueryTokens(query);
+    const expanded = await this.expand(seeds, queryTokens);
+    timingMs.expand = Date.now() - t0;
+
+    // 4. 打包
+    t0 = Date.now();
+    const packer = new ContextPacker(this.projectId, this.config);
+    const files = await packer.pack([...seeds, ...expanded]);
+    timingMs.pack = Date.now() - t0;
+
+    return {
+      query,
+      seeds,
+      expanded,
+      files,
+      debug: {
+        wVec: this.config.wVec,
+        wLex: this.config.wLex,
+        timingMs,
+      },
+    };
+  }
+
+  /**
+   * 全局 Rerank + SmartCutoff（多项目漏斗阶段二用）
+   *
+   * 只做 rerank 和 cutoff，不依赖本 service 的 DB/VectorStore。
+   * rerank 只需要文本内容（record.display_code / breadcrumb），与 projectId 无关。
+   *
+   * @param query 查询语句
+   * @param candidates 已合并的跨项目候选
+   * @returns rerank + cutoff 后的全局 seeds
+   */
+  async rerankAndCutoff(query: string, candidates: ScoredChunk[]): Promise<ScoredChunk[]> {
+    const topM = candidates.sort((a, b) => b.score - a.score).slice(0, this.config.fusedTopM);
+    const reranked = await this.rerank(query, topM);
+    return this.applySmartCutoff(reranked);
+  }
+
+  /**
+   * Expand + Pack（多项目漏斗阶段三用）
+   *
+   * 接收已经全局 rerank+cutoff 后属于本 service projectId 的 seeds，
+   * 做 expand（邻居/面包屑/import）+ pack，返回该子项目的 ContextPack。
+   *
+   * @param query 查询语句
+   * @param seeds 属于本 service projectId 的 seeds
+   */
+  async expandAndPack(query: string, seeds: ScoredChunk[]): Promise<ContextPack> {
+    const timingMs: Record<string, number> = {};
+    let t0 = Date.now();
+
+    const queryTokens = this.extractQueryTokens(query);
+    const expanded = await this.expand(seeds, queryTokens);
+    timingMs.expand = Date.now() - t0;
+
+    t0 = Date.now();
+    const packer = new ContextPacker(this.projectId, this.config);
+    const files = await packer.pack([...seeds, ...expanded]);
+    timingMs.pack = Date.now() - t0;
+
+    return {
+      query,
+      seeds,
+      expanded,
+      files,
+      debug: {
+        wVec: this.config.wVec,
+        wLex: this.config.wLex,
+        timingMs,
+      },
+    };
+  }
+
   // 召回方法
 
   /**
