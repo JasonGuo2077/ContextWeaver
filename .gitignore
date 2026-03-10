@@ -8,3 +8,4 @@ dist
 .playwright-mcp/
 .snow
 .history
+repo_map.json
