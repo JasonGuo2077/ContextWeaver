@@ -58,6 +58,8 @@ export interface ScanOptions {
   force?: boolean;
   /** 是否进行向量索引（默认 true） */
   vectorIndex?: boolean;
+  /** 是否启用自愈机制（默认 true） */
+  selfHeal?: boolean;
   /** 进度回调 */
   onProgress?: ProgressCallback;
 }
@@ -202,16 +204,32 @@ export async function scan(rootPath: string, options: ScanOptions = {}): Promise
 
       // 自愈：检查 unchanged 文件是否需要补索引
       // 需要重新处理这些文件以获取完整的 chunks（unchanged 状态的 chunks 是空的）
+      const enableSelfHeal = options.selfHeal !== false; // 默认启用
       const healingPathSet = new Set(getFilesNeedingVectorIndex(db));
       const healingFilePaths = results
         .filter((r) => r.status === 'unchanged' && healingPathSet.has(r.relPath))
         .map((r) => r.absPath);
 
       let healingFiles: ProcessResult[] = [];
-      if (healingFilePaths.length > 0) {
+      if (enableSelfHeal && healingFilePaths.length > 0) {
         logger.info({ count: healingFilePaths.length }, '自愈：发现需要补索引的文件');
-        // 重新处理这些文件（传入空的 knownFiles 强制重新读取和分片）
-        const processedHealingFiles = await processFiles(rootPath, healingFilePaths, new Map());
+        
+        // 分批处理避免内存溢出（每批最多 200 个文件）
+        const HEALING_BATCH_SIZE = 200;
+        const processedHealingFiles: ProcessResult[] = [];
+        
+        for (let i = 0; i < healingFilePaths.length; i += HEALING_BATCH_SIZE) {
+          const batch = healingFilePaths.slice(i, i + HEALING_BATCH_SIZE);
+          const batchNum = Math.floor(i / HEALING_BATCH_SIZE) + 1;
+          const totalBatches = Math.ceil(healingFilePaths.length / HEALING_BATCH_SIZE);
+          
+          logger.info({ batchNum, totalBatches, files: batch.length }, '自愈批次处理');
+          
+          // 重新处理这些文件（传入空的 knownFiles 强制重新读取和分片）
+          const batchResults = await processFiles(rootPath, batch, new Map());
+          processedHealingFiles.push(...batchResults);
+        }
+        
         // 将状态改为 modified 确保 indexer 会处理
         healingFiles = processedHealingFiles
           .filter((r) => r.status === 'added' || r.status === 'modified')

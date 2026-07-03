@@ -110,12 +110,21 @@ interface RepoMapConfig {
 cli
   .command('index [path]', '扫描代码库并建立索引')
   .option('-f, --force', '强制重新索引')
-  .option('--multi', '当传入父目录时自动索引所有子项目（识别独立 git 仓库 / Gradle 工程）')
+  .option('--repo-path <path>', '代码库根目录（与 positional [path] 等价，优先级更高）')
+  .option('--multi-project', '当传入父目录时自动索引所有子项目（识别独立 git 仓库 / Gradle 工程），与 search 命令风格保持一致')
+  .option('--no-self-heal', '禁用自愈重建索引，未索引时直接报错（默认开启自愈）')
   .option('--config <file>', '按 repo_map.json 配置文件批量索引（每个 repo_id 单独建索引）')
   .option('--base-dir <dir>', '配合 --config 使用：本地仓库的根目录（repo_id 目录所在的父目录）')
   .option('--sentry-project <name>', '配合 --config 使用：只索引指定 sentry_project_map key 下的仓库（默认全部）')
-  .action(async (targetPath: string | undefined, options: { force?: boolean; multi?: boolean; config?: string; baseDir?: string; sentryProject?: string }) => {
-    const rootPath = targetPath ? path.resolve(targetPath) : process.cwd();
+  .action(async (targetPath: string | undefined, options: { force?: boolean; repoPath?: string; multiProject?: boolean; selfHeal?: boolean; config?: string; baseDir?: string; sentryProject?: string }) => {
+    // --repo-path 优先，其次 positional [path]，最后回退到 cwd
+    const rootPath = options.repoPath
+      ? path.resolve(options.repoPath)
+      : targetPath
+        ? path.resolve(targetPath)
+        : process.cwd();
+    const isMulti = options.multiProject;
+    const selfHeal = options.selfHeal !== false;
 
     // ── --config 模式：按 repo_map.json 逐仓库建独立索引 ─────────────────
     if (options.config) {
@@ -189,6 +198,7 @@ cli
           let lastLoggedPercent = 0;
           const stats: ScanStats = await scan(repoPath, {
             force: options.force,
+            selfHeal,
             onProgress: (current, total, message) => {
               if (total !== undefined) {
                 const percent = Math.floor((current / total) * 100);
@@ -295,8 +305,8 @@ cli
 
     const parentIsProject = await isProjectDir(rootPath);
 
-    if (options.multi) {
-      // --multi 强制模式：扫描子目录，找出所有独立子项目
+    if (isMulti) {
+      // --multi / --multi-project 强制模式：扫描子目录，找出所有独立子项目
       const subprojects = await findSubprojects(rootPath);
       if (subprojects.length === 0) {
         // 没找到任何子项目，降级为索引 rootPath 本身
@@ -310,7 +320,7 @@ cli
       const subprojects = await findSubprojects(rootPath);
       if (subprojects.length > 0) {
         logger.info(
-          `检测到 ${subprojects.length} 个子项目，将分别索引（使用 --multi 可显式指定此行为）`,
+          `检测到 ${subprojects.length} 个子项目，将分别索引（使用 --multi-project 可显式指定此行为）`,
         );
         projectPaths = subprojects;
       } else {
@@ -349,6 +359,7 @@ cli
         let lastLoggedPercent = 0;
         const stats: ScanStats = await scan(projPath, {
           force: options.force,
+          selfHeal,
           onProgress: (current, total, message) => {
             if (total !== undefined) {
               const percent = Math.floor((current / total) * 100);
